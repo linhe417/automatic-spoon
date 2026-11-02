@@ -2,10 +2,29 @@
 import unittest
 import numpy as np
 import pandas as pd
-from experiment import conformal_radius, daily_intervals, make_demo, prepare, trading_signals
+from experiment import (conformal_radius, daily_intervals, daily_calibrated_bounds,
+                        nonconformity, make_demo, prepare, trading_signals)
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_cqr_scores_and_finite_sample_expansion(self):
+        lower, upper = np.array([0., 0., 0.]), np.array([2., 2., 2.])
+        scores = nonconformity(lower, upper, np.array([-2., 1., 5.]))
+        np.testing.assert_array_equal(scores, [2., 0., 3.])
+        q = conformal_radius(scores, .25)
+        self.assertEqual(q, 3.)
+        np.testing.assert_array_equal(lower - q, [-3., -3., -3.])
+        np.testing.assert_array_equal(upper + q, [5., 5., 5.])
+
+    def test_cqr_updates_use_base_not_expanded_interval(self):
+        times = pd.date_range("2025-01-01", periods=48, freq="h", tz="UTC")
+        lower, upper, actual = np.zeros(48), np.ones(48), np.full(48, 5.)
+        lo, hi = daily_calibrated_bounds(lower, upper, actual, times,
+                                        np.full(24, 2.), .1, 24)
+        np.testing.assert_array_equal(hi[:24], np.full(24, 3.))
+        np.testing.assert_array_equal(hi[24:], np.full(24, 5.))
+        np.testing.assert_array_equal(lo[24:], np.full(24, -4.))
+
     def test_finite_sample_quantile(self):
         self.assertEqual(conformal_radius(np.arange(1, 10), .2), 8)
         self.assertTrue(np.isinf(conformal_radius([1, 2], .1)))

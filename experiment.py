@@ -78,15 +78,45 @@ def daily_intervals(pred, actual, timestamps, calibration_scores, alpha, window)
     This assumes yesterday's settlement prices are available at today's issue time.
     Adapt the update delay to the actual market publication schedule.
     """
+    return daily_calibrated_bounds(pred, pred, actual, timestamps,
+                                   calibration_scores, alpha, window)
+
+
+def nonconformity(lower, upper, actual):
+    """Use expansion-only CQR scores; an already covered label scores zero.
+
+    Clipping at zero is conservative relative to signed CQR and prevents
+    calibrated intervals from shrinking into empty sets.
+    """
+    return np.maximum(np.maximum(lower - actual, actual - upper), 0.)
+
+
+def daily_calibrated_bounds(base_lower, base_upper, actual, timestamps,
+                            calibration_scores, alpha, window):
+    """Calibrate arbitrary base intervals using only completed prior days."""
+    if window < 1:
+        raise ValueError("Window must be positive.")
     history = deque(np.asarray(calibration_scores)[-window:], maxlen=window)
-    lower, upper = np.empty(len(pred)), np.empty(len(pred))
+    lower, upper = np.empty(len(actual)), np.empty(len(actual))
     days = pd.DatetimeIndex(timestamps).floor("D")
     for day in days.unique():
         mask = days == day
         q = conformal_radius(list(history), alpha)
-        lower[mask], upper[mask] = pred[mask] - q, pred[mask] + q
-        history.extend(np.abs(actual[mask] - pred[mask]))
+        lower[mask], upper[mask] = base_lower[mask] - q, base_upper[mask] + q
+        history.extend(nonconformity(base_lower[mask], base_upper[mask], actual[mask]))
     return lower, upper
+
+
+def quantile_bounds(train, frame, target, alpha):
+    """Fit lower/upper quantile models on training data only, then sort crossings."""
+    endpoints = []
+    for quantile in (alpha / 2, 1 - alpha / 2):
+        model = HistGradientBoostingRegressor(
+            loss="quantile", quantile=quantile, max_iter=100,
+            max_leaf_nodes=15, random_state=42)
+        model.fit(train[FEATURES], train[target])
+        endpoints.append(model.predict(frame[FEATURES]))
+    return np.minimum(*endpoints), np.maximum(*endpoints)
 
 
 def interval_metrics(y, pred, lower, upper, alpha):
@@ -105,8 +135,8 @@ def trading_signals(lower, upper, cost):
 
 
 def run(raw, output, alpha=.1, window=24 * 14, cost=2.):
-    if window < 1 or cost < 0:
-        raise ValueError("Window must be positive and cost must be nonnegative.")
+    if not 0 < alpha < 1 or window < 1 or not np.isfinite(cost) or cost < 0:
+        raise ValueError("Require 0 < alpha < 1, a positive window and finite nonnegative cost.")
     df = prepare(raw)
     # Split on whole days so a test day never overlaps calibration.
     days = df["timestamp"].dt.floor("D").drop_duplicates().to_list()
@@ -127,6 +157,19 @@ def run(raw, output, alpha=.1, window=24 * 14, cost=2.):
         q = conformal_radius(residuals, alpha)
         bounds = {"fixed": (pred - q, pred + q),
                   "rolling": daily_intervals(pred, y, test.timestamp, residuals, alpha, window)}
+        # Predict calibration and test endpoints with the same train-only models.
+        quantile_lower, quantile_upper = quantile_bounds(
+            train, pd.concat([cal, test]), target, alpha)
+        cal_lower, lower = quantile_lower[:len(cal)], quantile_lower[len(cal):]
+        cal_upper, upper = quantile_upper[:len(cal)], quantile_upper[len(cal):]
+        scores = nonconformity(cal_lower, cal_upper, cal[target].to_numpy())
+        correction = conformal_radius(scores, alpha)
+        bounds.update({
+            "quantile": (lower, upper),
+            "cqr_fixed": (lower - correction, upper + correction),
+            "cqr_rolling": daily_calibrated_bounds(
+                lower, upper, y, test.timestamp, scores, alpha, window),
+        })
         predictions[f"{target}_prediction"] = pred
         for method, (lower, upper) in bounds.items():
             rows.append({"target": target, "method": method,
@@ -165,10 +208,10 @@ def run(raw, output, alpha=.1, window=24 * 14, cost=2.):
     fig, axes = plt.subplots(2, 1, figsize=(12, 7))
     count = min(168, len(test))
     t = test.timestamp.iloc[:count]
-    lo, hi = spread_bounds["rolling"]
+    lo, hi = spread_bounds["cqr_rolling"]
     axes[0].plot(t, test.spread.iloc[:count], label="Realized RT - DA", linewidth=1)
     axes[0].plot(t, spread_pred[:count], label="Point forecast", linewidth=1)
-    axes[0].fill_between(t, lo[:count], hi[:count], alpha=.25, label="Rolling conformal interval")
+    axes[0].fill_between(t, lo[:count], hi[:count], alpha=.25, label="Rolling CQR interval")
     axes[0].set_ylabel("Price spread (currency/MWh)")
     axes[0].legend()
     for name in signals:
